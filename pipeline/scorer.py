@@ -1,41 +1,53 @@
 import numpy as np
-from pipeline.quality import FLAG_BITS
 
-
+# Hard collapse: any hard flag → CIS = 0 immediately
 HARD_FLAGS = {"MISSING_V", "DROP_P"}
-SOFT_FLAGS = {"JITTER_A", "BLUR", "EXPO_S", "STALL", "COMP_A", "SYNC_ERR", "JITTER_V"}
+
+# Soft flags — SYNC_ERR gets a 3× multiplier applied in code below
+SOFT_FLAGS = {"JITTER_A", "BLUR", "EXPO_S", "STALL", "COMP_A",
+              "SYNC_ERR", "JITTER_V", "DUP_FRAME", "ACT_SAT"}
+
+SYNC_ERR_WEIGHT_MULTIPLIER = 3.0   # "unlearnable poison" multiplier
 
 
 class ExampleScorer:
     def __init__(self, config: dict):
-        self.weights = config["quality"]["weights"]
+        self.weights  = config["quality"]["weights"]
+        q             = config["quality"]
+        self.min_eqs  = q["min_quality_score"]
+        # Uncertainty band: [min_eqs, min_eqs + uncertainty_band] → flagged for human review
+        self.uncertainty_band = q.get("uncertainty_band", 0.15)
 
-    def score(self, bitmask: int, details: dict) -> float:
+    def score(self, bitmask: int, details: dict) -> dict:
         """
-        Compute EQS from bitmask and optional detail values.
-        Returns float in [0, 1].
+        Compute CIS and uncertainty tag from bitmask and flag details.
+
+        Returns dict with:
+          cis:          float in [0, 1]
+          uncertain:    bool — True if score is in the manual-review priority band
+          accepted:     bool — CIS >= min_quality_score
         """
         flag_names = set(details.get("flag_names", []))
 
-        # Hard penalty: any hard flag -> 0.0
-        hard_product = 1.0
+        # Hard collapse
         for flag in HARD_FLAGS:
             if flag in flag_names:
-                hard_product = 0.0
-                break
+                return {"cis": 0.0, "uncertain": False, "accepted": False}
 
-        if hard_product == 0.0:
-            return 0.0
-
-        # Soft penalty: weighted sum of active soft flags
+        # Weighted soft penalty — SYNC_ERR is 3× heavier
         soft_sum = 0.0
         for flag, weight in self.weights.items():
             if flag in flag_names:
-                soft_sum += weight
+                effective_weight = weight * (SYNC_ERR_WEIGHT_MULTIPLIER if flag == "SYNC_ERR" else 1.0)
+                soft_sum += effective_weight
 
-        eqs = hard_product * np.exp(-soft_sum)
-        return float(np.clip(eqs, 0.0, 1.0))
+        cis      = float(np.clip(np.exp(-soft_sum), 0.0, 1.0))
+        accepted = cis >= self.min_eqs
 
-    def score_batch(self, windows_with_flags: list[tuple[dict, int, dict]]) -> list[float]:
-        """Score a batch of (window, bitmask, details) tuples."""
+        # Uncertainty tagging: borderline examples near the acceptance threshold
+        uncertain = (not accepted) and (cis >= self.min_eqs - self.uncertainty_band)
+
+        return {"cis": cis, "uncertain": uncertain, "accepted": accepted}
+
+    def score_batch(self, windows_with_flags: list[tuple[dict, int, dict]]) -> list[dict]:
         return [self.score(bitmask, details) for _, bitmask, details in windows_with_flags]
