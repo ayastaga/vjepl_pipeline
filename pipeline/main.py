@@ -1,5 +1,6 @@
 import sys
 import yaml
+import json
 import numpy as np
 import pandas as pd
 import matplotlib
@@ -98,8 +99,9 @@ def run_pipeline(config: dict):
         # Stages 5-7: Flag + Score + Export each window
         for window in windows:
             bitmask, details = flagger.flag_window(window, corrected_cam_ts)
-            eqs = scorer.score(bitmask, details)
-            exporter.export_window(window, bitmask, details, eqs, event_tag)
+            score_result = scorer.score(bitmask, details)
+            eqs = score_result["cis"]
+            exporter.export_window(window, bitmask, details, score_result, event_tag)
             all_scores.append(eqs)
             total_windows += 1
 
@@ -123,6 +125,7 @@ def run_pipeline(config: dict):
     _plot_drift(drift_records, plots_dir)
     _plot_quality_histogram(all_scores, config["quality"]["min_quality_score"], plots_dir)
     _plot_sample_windows(exporter.manifest, plots_dir)
+    _plot_flag_cooccurrence(exporter.manifest, plots_dir)
 
     # ============================================================
     # QA SIMULATION (2% manual review)
@@ -134,11 +137,16 @@ def run_pipeline(config: dict):
 
     print("\n" + "="*60)
     print("PIPELINE COMPLETE")
-    print(f"  Accepted examples: {sum(1 for r in exporter.manifest if r['accepted'])}")
-    print(f"  Rejected examples: {sum(1 for r in exporter.manifest if not r['accepted'])}")
-    print(f"  Mean EQS: {np.mean(all_scores):.3f}  Std: {np.std(all_scores):.3f}")
+    accepted_ct  = sum(1 for r in exporter.manifest if r["accepted"])
+    rejected_ct  = sum(1 for r in exporter.manifest if not r["accepted"])
+    uncertain_ct = sum(1 for r in exporter.manifest if r.get("uncertain", False))
+    print(f"  Accepted examples:  {accepted_ct}")
+    print(f"  Rejected examples:  {rejected_ct}")
+    print(f"  Uncertain (review): {uncertain_ct}")
+    print(f"  Mean CIS: {np.mean(all_scores):.3f}  Std: {np.std(all_scores):.3f}")
+    print(f"  Shards: {manifest_path.replace('manifest.csv','shards/')}")
     print(f"  Manifest: {manifest_path}")
-    print(f"  Plots: {plots_dir}/")
+    print(f"  Plots: {plots_dir}/  (drift_correction, quality_histogram, sample_windows, flag_cooccurrence)")
     print("="*60)
 
 
@@ -177,12 +185,14 @@ def _plot_quality_histogram(scores: list, threshold: float, plots_dir: Path):
     ax.hist(scores_arr[scores_arr < threshold], bins=n_bins, color="#e74c3c",
             alpha=0.8, label=f"Rejected (<{threshold})")
     ax.axvline(threshold, color="black", linestyle="--", linewidth=2, label=f"Threshold = {threshold}")
-    ax.set_xlabel("Example Quality Score (EQS)", fontsize=12)
+    # Uncertainty band
+    unc_lo = max(0, threshold - 0.15)
+    ax.axvspan(unc_lo, threshold, alpha=0.15, color="orange", label="Uncertainty band (priority review)")
+    ax.set_xlabel("Causal Integrity Score (CIS)", fontsize=12)
     ax.set_ylabel("Count", fontsize=12)
-    ax.set_title("Distribution of Example Quality Scores", fontsize=14, fontweight="bold")
+    ax.set_title("Distribution of Causal Integrity Scores\n(SYNC_ERR weighted 3×)", fontsize=13, fontweight="bold")
     ax.legend()
     ax.grid(True, alpha=0.3)
-    # Stats box
     stats_text = f"n={len(scores_arr)}\nμ={scores_arr.mean():.3f}\nσ={scores_arr.std():.3f}\nmin={scores_arr.min():.3f}"
     ax.text(0.02, 0.95, stats_text, transform=ax.transAxes,
             verticalalignment='top', fontfamily='monospace',
@@ -194,41 +204,51 @@ def _plot_quality_histogram(scores: list, threshold: float, plots_dir: Path):
 
 
 def _plot_sample_windows(manifest: list, plots_dir: Path):
-    """Show context vs target frame grids for best and worst EQS examples."""
+    """Show context vs target frame grids for best and worst CIS examples."""
     if not manifest:
         return
 
     sorted_m = sorted(manifest, key=lambda r: r["example_quality_score"])
     worst = sorted_m[0]
-    best = sorted_m[-1]
+    best  = sorted_m[-1]
 
     fig = plt.figure(figsize=(16, 8))
-    fig.suptitle("Sample Training Windows: Context vs Target Frames", fontsize=14, fontweight="bold")
+    fig.suptitle("Sample Training Windows: Context vs Target Frames\n(left = highest CIS, right = lowest CIS)",
+                 fontsize=13, fontweight="bold")
 
-    for col_idx, (label, row) in enumerate([("HIGH EQS", best), ("LOW EQS", worst)]):
-        npz_path = Path("data_processed") / row["npz_path"]
-        if not npz_path.exists():
+    for col_idx, (label, row) in enumerate([("HIGH CIS", best), ("LOW CIS", worst)]):
+        shard_name = row.get("shard", "")
+        example_key = row.get("example_key", "")
+        sub = "shards" if row.get("accepted", True) else "rejected"
+        shard_path = Path("data_processed") / sub / shard_name
+        if not shard_path.exists() or not example_key:
             continue
-        data = np.load(str(npz_path))
-        ctx = data["ctx_video"]
-        tgt = data["tgt_video"]
 
-        n_show_ctx = min(4, len(ctx))
-        n_show_tgt = min(4, len(tgt))
-        n_show = n_show_ctx + n_show_tgt
+        # Read arrays back from tar shard
+        try:
+            import tarfile, io
+            with tarfile.open(str(shard_path), "r") as tf:
+                ctx = np.load(io.BytesIO(tf.extractfile(f"{example_key}/ctx_video.npy").read()))
+                tgt = np.load(io.BytesIO(tf.extractfile(f"{example_key}/tgt_video.npy").read()))
+        except Exception:
+            continue
 
-        for i in range(n_show_ctx):
+        n_show = 4
+        for i in range(n_show):
             ax = fig.add_subplot(4, 8, col_idx * 4 + i + 1)
-            ax.imshow(ctx[int(i * len(ctx) / n_show_ctx)][:, :, ::-1])  # BGR->RGB
+            frame_idx = int(i * len(ctx) / n_show)
+            ax.imshow(ctx[frame_idx][:, :, ::-1])
             ax.set_title(f"ctx {i}", fontsize=7)
             ax.axis("off")
             if i == 0:
-                ax.set_ylabel(f"{label}\nEQS={row['example_quality_score']:.2f}\n{row['quality_flags'][:20]}",
+                flags_short = row.get("quality_flags","")[:25]
+                ax.set_ylabel(f"{label}\nCIS={row['example_quality_score']:.2f}\n{flags_short}",
                               fontsize=7, rotation=0, ha='right')
 
-        for i in range(n_show_tgt):
+        for i in range(n_show):
             ax = fig.add_subplot(4, 8, col_idx * 4 + i + 1 + 16)
-            ax.imshow(tgt[int(i * len(tgt) / n_show_tgt)][:, :, ::-1])
+            frame_idx = int(i * len(tgt) / n_show)
+            ax.imshow(tgt[frame_idx][:, :, ::-1])
             ax.set_title(f"tgt {i}", fontsize=7)
             ax.axis("off")
 
@@ -238,37 +258,98 @@ def _plot_sample_windows(manifest: list, plots_dir: Path):
     print(f"  Saved: {plots_dir}/sample_windows.png")
 
 
+def _plot_flag_cooccurrence(manifest: list, plots_dir: Path):
+    """
+    Flag co-occurrence heatmap.
+    Cell [i,j] = fraction of examples where both flag_i and flag_j are set.
+    Diagonal = individual flag prevalence.
+    Useful for dashboard monitoring: correlated flags suggest a shared root cause
+    (e.g., STALL + ACT_SAT always co-occurring → robot hitting limit, not just slow).
+    """
+    if not manifest:
+        return
+
+    from collections import Counter
+    # Collect all flag names present in the dataset
+    all_flag_sets = []
+    for row in manifest:
+        flags_str = row.get("quality_flags", "")
+        flags = set(f for f in flags_str.split("|") if f) if flags_str else set()
+        all_flag_sets.append(flags)
+
+    all_flags_seen = sorted({f for fs in all_flag_sets for f in fs})
+    if len(all_flags_seen) < 2:
+        return
+
+    n = len(all_flags_seen)
+    matrix = np.zeros((n, n))
+    total = len(all_flag_sets)
+
+    for i, fi in enumerate(all_flags_seen):
+        for j, fj in enumerate(all_flags_seen):
+            count = sum(1 for fs in all_flag_sets if fi in fs and fj in fs)
+            matrix[i, j] = count / max(total, 1)
+
+    fig, ax = plt.subplots(figsize=(max(7, n), max(6, n - 1)))
+    im = ax.imshow(matrix, cmap="YlOrRd", aspect="auto", vmin=0, vmax=1)
+    ax.set_xticks(range(n))
+    ax.set_yticks(range(n))
+    ax.set_xticklabels(all_flags_seen, rotation=45, ha="right", fontsize=9)
+    ax.set_yticklabels(all_flags_seen, fontsize=9)
+    ax.set_title("Flag Co-occurrence Matrix\n(fraction of examples where both flags are set)",
+                 fontsize=12, fontweight="bold")
+    plt.colorbar(im, ax=ax, label="Co-occurrence fraction")
+
+    # Annotate cells with values
+    for i in range(n):
+        for j in range(n):
+            val = matrix[i, j]
+            color = "white" if val > 0.5 else "black"
+            ax.text(j, i, f"{val:.2f}", ha="center", va="center", fontsize=7, color=color)
+
+    plt.tight_layout()
+    plt.savefig(plots_dir / "flag_cooccurrence.png", dpi=120, bbox_inches="tight")
+    plt.close()
+    print(f"  Saved: {plots_dir}/flag_cooccurrence.png")
+
+
 def _simulate_qa(manifest: list, config: dict):
-    """Simulate the 2% manual review strategy."""
+    """Simulate the 2% manual review strategy with uncertainty-prioritised sampling."""
     df = pd.DataFrame(manifest)
     n_total = len(df)
     review_frac = config["qa"]["manual_review_fraction"]
     n_review = max(1, int(n_total * review_frac))
     outlier_thr = config["qa"]["outlier_low_eqs_threshold"]
 
-    n_random = n_review // 2
-    n_outlier = n_review - n_random
+    n_random  = n_review // 3
+    n_outlier = n_review // 3
+    n_uncertain = n_review - n_random - n_outlier
 
-    random_sample = df.sample(n=min(n_random, len(df)), random_state=42)
-    outlier_pool = df[df["example_quality_score"] < outlier_thr]
-    outlier_sample = outlier_pool.sample(n=min(n_outlier, len(outlier_pool)), random_state=42)
+    random_sample   = df.sample(n=min(n_random, len(df)), random_state=42)
+    outlier_pool    = df[df["example_quality_score"] < outlier_thr]
+    outlier_sample  = outlier_pool.sample(n=min(n_outlier, len(outlier_pool)), random_state=42)
+    uncertain_pool  = df[df.get("uncertain", pd.Series([False]*len(df))).astype(bool)] if "uncertain" in df.columns else pd.DataFrame()
+    uncertain_sample = uncertain_pool.sample(n=min(n_uncertain, len(uncertain_pool)), random_state=42) if len(uncertain_pool) > 0 else pd.DataFrame()
 
-    combined = pd.concat([random_sample, outlier_sample]).drop_duplicates()
+    combined = pd.concat([random_sample, outlier_sample, uncertain_sample]).drop_duplicates()
 
     print(f"\n  QA REVIEW PLAN (2% = {n_review} examples from {n_total} total):")
-    print(f"    Random sample:  {len(random_sample)} examples")
-    print(f"    Outlier sample: {len(outlier_sample)} examples (EQS < {outlier_thr})")
-    print(f"    Combined unique: {len(combined)} examples")
+    print(f"    Random sample:    {len(random_sample)} examples (baseline coverage)")
+    print(f"    Outlier sample:   {len(outlier_sample)} examples (CIS < {outlier_thr})")
+    print(f"    Uncertain sample: {len(uncertain_sample)} examples (near acceptance boundary)")
+    print(f"    Combined unique:  {len(combined)} examples")
     print(f"\n  WHAT HUMANS CHECK:")
-    print(f"    - Visual coherence of ctx/tgt frame pairs")
-    print(f"    - Action/state synchrony (do joints move when commanded?)")
-    print(f"    - Exposure or blur artifacts not caught by automated flags")
-    print(f"    - Label utility (does this window teach useful dynamics?)")
+    print(f"    - SYNC_ERR: does the robot actually move as commanded? (most critical)")
+    print(f"    - DUP_FRAME: are consecutive frames suspiciously identical?")
+    print(f"    - ACT_SAT: is the robot hitting joint limits and ignoring commands?")
+    print(f"    - Visual blur/exposure artifacts not caught by Laplacian threshold")
+    print(f"    - Label utility: does this window teach useful causal dynamics?")
     print(f"\n  AUTOMATED DASHBOARD METRICS:")
-    print(f"    - EQS distribution per episode and overall")
-    print(f"    - Flag co-occurrence heatmap")
-    print(f"    - Per-flag prevalence rates")
-    print(f"    - Shard-level variance of quality scores")
+    print(f"    - CIS distribution per episode and overall (with hard/soft breakdown)")
+    print(f"    - SYNC_ERR residual histogram (most critical — 3× weight in CIS)")
+    print(f"    - Flag co-occurrence heatmap (STALL + ACT_SAT often co-occur)")
+    print(f"    - Per-shard CIS variance (high variance = inhomogeneous episode quality)")
+    print(f"    - DUP_FRAME rate per camera (sudden spike = encoder stall)")
 
     # Print flag prevalence
     if len(df) > 0 and "quality_flags" in df.columns:
@@ -279,7 +360,7 @@ def _simulate_qa(manifest: list, config: dict):
         flag_counts = Counter(all_flags)
         print(f"\n  FLAG PREVALENCE:")
         for flag, count in sorted(flag_counts.items(), key=lambda x: -x[1]):
-            print(f"    {flag:<12} {count:4d}  ({100*count/max(n_total,1):.1f}%)")
+            print(f"    {flag:<14} {count:4d}  ({100*count/max(n_total,1):.1f}%)")
 
 
 if __name__ == "__main__":
