@@ -1,0 +1,43 @@
+# ── Visualization Configuration ───────────────────────────────────────────────
+# Add this block to your existing config.yaml
+#
+# CLI override examples:
+#   python pipeline/main.py --visualize all
+#   python pipeline/main.py --visualize quality,eqs,rejection
+#   python pipeline/main.py --visualize none
+#
+visualization:
+  enabled: true
+
+  # Output root for all plots (subdirs created per stage automatically)
+  output_dir: data_processed/plots
+
+  # Per-stage toggle. Set to false to skip a stage's visualizations entirely.
+  stages:
+    drift: true
+    alignment: true
+    window: true
+    quality: true
+    eqs: true
+    dynamics: true
+    episode: true
+    diversity: true
+    rejection: true
+
+  # Plotting behavior
+  figure_dpi: 150
+  deterministic_seed: 42 # Used for any random operations (t-SNE subsampling, etc.)
+
+  # Per-stage metric emission: these control whether each pipeline stage
+  # actually collects and returns a metrics dict for the visualizer.
+  # Set to false if you want the pipeline to run fast without collecting metrics.
+  collect_metrics:
+    drift: true
+    alignment: true
+    window: true
+    quality: true
+    eqs: true
+    dynamics: true
+    episode: true
+    diversity: false # Expensive: requires pre-computed embeddings
+    rejection: true
