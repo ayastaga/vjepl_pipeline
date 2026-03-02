@@ -1,0 +1,54 @@
+pipeline:
+  context_seconds: 2.0
+  target_seconds: 1.0
+  video_fps: 30
+  action_hz: 50
+  state_hz: 50
+  stride_seconds: 0.5 # how often we cut a new training example
+
+generation:
+  num_episodes: 10
+  min_duration: 10.0
+  max_duration: 25.0
+  video_width: 64
+  video_height: 64
+  seed: 42
+
+noise:
+  drop_frame_prob: 0.03
+  jitter_std_ms: 5.0
+  clock_drift_rate: 0.001 # fractional drift per second
+  stall_prob: 0.08
+  exposure_shift_prob: 0.05
+  blur_prob: 0.04
+  packet_loss_prob: 0.02
+  action_lag_frames: 2
+
+quality:
+  # Hard flag thresholds
+  missing_frame_gap_ms: 66.0
+  missing_frame_max_consecutive: 3
+  jitter_var_threshold_ms2: 0.5 # lower = more sensitive
+  blur_laplacian_threshold: 800.0 # higher = more sensitive (synthetic frames are high-var)
+  stall_joint_delta_threshold: 0.05
+  exposure_shift_threshold: 0.15 # lower = catch smaller shifts
+  sync_error_threshold: 0.02
+  packet_loss_max_fraction: 0.10
+  compression_dct_threshold: 0.08
+
+  # Soft penalty weights (for EQS)
+  weights:
+    JITTER_A: 0.3
+    BLUR: 0.4
+    EXPO_S: 0.5
+    STALL: 0.3
+    COMP_A: 0.2
+    JITTER_V: 0.4
+    SYNC_ERR: 0.3
+
+  # EQS threshold for filtering
+  min_quality_score: 0.3
+
+qa:
+  manual_review_fraction: 0.02
+  outlier_low_eqs_threshold: 0.4
