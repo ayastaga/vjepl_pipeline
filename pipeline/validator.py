@@ -1,5 +1,6 @@
 import json
 import shutil
+import numpy as np
 import pandas as pd
 from pathlib import Path
 
@@ -11,7 +12,11 @@ class EpisodeValidator:
         self.cfg = config
         ctx = config["pipeline"]["context_seconds"]
         tgt = config["pipeline"]["target_seconds"]
-        self.min_duration = ctx + tgt  # need at least one window
+        self.min_duration = ctx + tgt
+        self.expected_action_hz  = config["pipeline"]["action_hz"]
+        self.expected_video_fps  = config["pipeline"]["video_fps"]
+        # Tolerance: actual rate must be within ±20% of nominal
+        self.rate_tolerance = 0.20
 
     def validate(self, episode_dir: str) -> dict:
         """
@@ -34,21 +39,70 @@ class EpisodeValidator:
             return self._fail(result, f"meta.json parse error: {e}")
 
         result["episode_id"] = meta.get("episode_id", ep_dir.name)
-        result["event_tag"] = meta.get("event_tag", "unknown")
+        result["event_tag"]  = meta.get("event_tag", "unknown")
         result["duration_s"] = meta.get("duration_s", 0)
 
         # 3. Minimum duration
         if result["duration_s"] < self.min_duration:
             return self._fail(result, f"Duration {result['duration_s']:.1f}s < minimum {self.min_duration}s")
 
-        # 4. CSV parseable with minimum rows
-        for fname in ["camera_timestamps.csv", "actions.csv", "states.csv"]:
+        # 4. CSV parseable with minimum rows + deep timestamp checks
+        for fname, expected_hz in [
+            ("camera_timestamps.csv", self.expected_video_fps),
+            ("actions.csv",           self.expected_action_hz),
+            ("states.csv",            self.expected_action_hz),
+        ]:
             try:
                 df = pd.read_csv(ep_dir / fname)
-                if len(df) < 10:
-                    return self._fail(result, f"{fname} has only {len(df)} rows")
             except Exception as e:
                 return self._fail(result, f"{fname} parse error: {e}")
+
+            if len(df) < 10:
+                return self._fail(result, f"{fname} has only {len(df)} rows")
+
+            # Identify timestamp column (first column named *timestamp* or first column)
+            ts_col = next((c for c in df.columns if "timestamp" in c.lower()), df.columns[0])
+            ts = df[ts_col].dropna().values.astype(float)
+
+            if len(ts) < 2:
+                return self._fail(result, f"{fname} insufficient timestamp rows")
+
+            # 4a. Monotonicity: no backwards jumps
+            diffs = np.diff(ts)
+            n_violations = int((diffs <= 0).sum())
+            if n_violations > 0:
+                return self._fail(result, f"{fname} has {n_violations} non-monotonic timestamp(s)")
+
+            # 4b. Sampling rate aliasing detection
+            #   Compute median inter-sample interval and compare to nominal.
+            #   Also check for bimodal intervals (hallmark of duplicated samples):
+            #   if >40% of intervals are within 1% of the minimum interval,
+            #   and the median interval is ~2× the minimum, it's a duplicated stream.
+            median_interval_s = float(np.median(diffs))
+            if median_interval_s <= 0:
+                return self._fail(result, f"{fname} zero median interval (constant timestamps)")
+
+            actual_hz = 1.0 / median_interval_s
+            lo = expected_hz * (1 - self.rate_tolerance)
+            hi = expected_hz * (1 + self.rate_tolerance)
+            if not (lo <= actual_hz <= hi):
+                return self._fail(
+                    result,
+                    f"{fname} apparent rate {actual_hz:.1f} Hz outside expected "
+                    f"{expected_hz} Hz ±{int(self.rate_tolerance*100)}% window. "
+                    f"Possible aliased/duplicated stream."
+                )
+
+            # 4c. Duplication check: min interval should be ~median interval.
+            min_interval_s = float(np.min(diffs[diffs > 1e-6]))
+            if min_interval_s > 0 and (median_interval_s / min_interval_s) > 1.8:
+                frac_at_min = float((diffs < min_interval_s * 1.01).mean())
+                if frac_at_min > 0.35:
+                    return self._fail(
+                        result,
+                        f"{fname} bimodal intervals suggest duplicated/aliased stream "
+                        f"(min={min_interval_s*1000:.1f}ms, median={median_interval_s*1000:.1f}ms)"
+                    )
 
         # 5. Frames directory not empty
         frames_dir = ep_dir / "frames"
