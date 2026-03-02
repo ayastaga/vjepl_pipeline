@@ -4,7 +4,7 @@ pipeline:
   video_fps: 30
   action_hz: 50
   state_hz: 50
-  stride_seconds: 0.5 # how often we cut a new training example
+  stride_seconds: 0.5
 
 generation:
   num_episodes: 10
@@ -17,26 +17,62 @@ generation:
 noise:
   drop_frame_prob: 0.03
   jitter_std_ms: 5.0
-  clock_drift_rate: 0.001 # fractional drift per second
-  stall_prob: 0.08
-  exposure_shift_prob: 0.05
-  blur_prob: 0.04
-  packet_loss_prob: 0.02
+  clock_drift_rate: 0.001 # base linear drift (fraction per second)
+  thermal_amplitude_scale: 0.4 # non-linear thermal drift amplitude (× drift_rate)
+  stall_prob: 0.25 # 25% of episodes have a stall segment
+  exposure_shift_prob: 0.30 # 30% of episodes have an exposure shift
+  blur_prob: 0.20 # 20% of episodes have a blur window
+  packet_loss_prob: 0.04 # background i.i.d. packet loss
+  burst_loss_rate_hz: 0.5 # bursty USB saturation events per second
+  burst_loss_duration_s: 0.20 # duration of each saturation burst
   action_lag_frames: 2
 
 quality:
-  # Hard flag thresholds
+  # Hard flag thresholds (→ CIS = 0)
   missing_frame_gap_ms: 66.0
   missing_frame_max_consecutive: 3
-  jitter_var_threshold_ms2: 0.5 # lower = more sensitive
-  blur_laplacian_threshold: 800.0 # higher = more sensitive (synthetic frames are high-var)
-  stall_joint_delta_threshold: 0.05
-  exposure_shift_threshold: 0.15 # lower = catch smaller shifts
-  sync_error_threshold: 0.02
   packet_loss_max_fraction: 0.10
+
+  # Soft flag thresholds
+  jitter_var_threshold_ms2: 0.5
+  blur_laplacian_threshold: 800.0
+  # STALL: cumulative joint delta threshold per window frame.
+  # With 7-DOF arm oscillating ±0.25 rad at 50Hz, a 2s window has ~0.5 rad total delta.
+  # Threshold at 0.05 rad/frame × 60 frames = 3.0 was calibrated for larger motions.
+  # New value: 0.004 rad/frame × 60 frames = 0.24 rad total — catches genuine stalls
+  # (robot frozen) without flagging slow deliberate motion.
+  stall_joint_delta_threshold: 0.004
+  exposure_shift_threshold: 0.15
   compression_dct_threshold: 0.08
 
-  # Soft penalty weights (for EQS)
+  # SYNC_ERR: physics residual threshold ||s_{t+1} - s_t - a_t|| > theta
+  # Units: radians (joint-space deltas at 50 Hz). A normal step is ~0.003–0.006 rad.
+  # The 2-frame action lag adds ~0.006 rad systematic offset; threshold is set above
+  # that to catch genuine corruption (stalls, bursty loss) not lag artefacts.
+  # Tune empirically: too low → false positives on valid lag; too high → misses sync bugs.
+  sync_error_threshold: 0.025
+
+  # DUP_FRAME: SSIM-proxy threshold (0.98 = nearly identical consecutive frames)
+  ssim_duplicate_threshold: 0.98
+
+  # ACT_SAT: fraction of joint range considered "at limit"
+  actuator_saturation_margin: 0.05
+
+  # Joint limits [lo, hi] in radians — Franka Panda 7-DOF.
+  # Synthetic data is centered at the midpoint of each joint's range
+  # (see JOINT_MIDPOINTS in log_generator.py) so normal motion stays well
+  # inside the 5% saturation margin. ACT_SAT only fires on genuine limit events.
+  joint_limits:
+    - [-2.8973, 2.8973] # joint_0  mid=0.0
+    - [-1.7628, 1.7628] # joint_1  mid=0.0
+    - [-2.8973, 2.8973] # joint_2  mid=0.0
+    - [-3.0718, -0.0698] # joint_3  mid=-1.5708
+    - [-2.8973, 2.8973] # joint_4  mid=0.0
+    - [-0.0175, 3.7525] # joint_5  mid=1.8675
+    - [-2.8973, 2.8973] # joint_6  mid=0.0
+
+  # CIS soft penalty weights
+  # SYNC_ERR is additionally multiplied by 3× in scorer.py (causal poison)
   weights:
     JITTER_A: 0.3
     BLUR: 0.4
@@ -44,10 +80,16 @@ quality:
     STALL: 0.3
     COMP_A: 0.2
     JITTER_V: 0.4
-    SYNC_ERR: 0.3
+    SYNC_ERR: 0.4 # effective weight = 0.4 × 3 = 1.2 (highest single-flag penalty)
+    DUP_FRAME: 0.5
+    ACT_SAT: 0.3
 
-  # EQS threshold for filtering
+  # Acceptance threshold and uncertainty band
   min_quality_score: 0.3
+  uncertainty_band: 0.15 # [0.15, 0.30) → uncertain, priority for manual review
+
+export:
+  examples_per_shard: 50 # rotate to new .tar after this many examples
 
 qa:
   manual_review_fraction: 0.02
